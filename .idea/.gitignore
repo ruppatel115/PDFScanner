@@ -1,0 +1,16 @@
+# Create minimal .gitignore
+echo "venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+invoice_renamer.log
+debug_*.txt" > .gitignore
+
+# Remove cached files and re-add
+git rm -r --cached .
+git add .
+
+# Commit and push
+git commit -m "Add .gitignore and clean up tracking"
+git push
