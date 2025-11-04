@@ -1,4 +1,15 @@
 import streamlit as st
+
+# MUST BE FIRST - Only one set_page_config allowed
+st.set_page_config(
+    page_title="AI PDF Document Renamer",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Then other imports
+from dotenv import load_dotenv
 import os
 import json
 from datetime import datetime
@@ -10,6 +21,8 @@ from pathlib import Path
 import zipfile
 import io
 import base64
+from PIL import Image
+import google.generativeai as genai
 
 # PDF and AI components
 try:
@@ -34,14 +47,28 @@ try:
 except ImportError as e:
     st.warning(f"OCR features disabled: {e}")
 
-# Configure page
-st.set_page_config(
-    page_title="AI PDF Document Renamer",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Then configuration
+load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
+# Then function definitions
+def get_gemini_response(input, image, prompt):
+    model = genai.GenerativeModel('gemini-pro-vision')
+    response = model.generate_content([input, image[0], prompt])
+    return response.text
+
+def input_image_setup(uploaded_file):
+    if uploaded_file is not None:
+        bytes_data = uploaded_file.getvalue()
+        image_parts = [
+            {
+                "mime_type": uploaded_file.type,
+                "data": bytes_data
+            }
+        ]
+        return image_parts
+    else:
+        raise FileNotFoundError("No file uploaded")
 
 class PDFInvoiceProcessor:
     def __init__(self):
