@@ -35,15 +35,6 @@ try:
 except ImportError as e:
     st.warning(f"OCR features disabled: {e}")
 
-# Configure page
-st.set_page_config(
-    page_title="AI PDF Document Renamer",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-
 class PDFInvoiceProcessor:
     def __init__(self):
         self.client = None
