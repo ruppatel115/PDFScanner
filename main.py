@@ -50,30 +50,31 @@ class PDFInvoiceProcessor:
         self.logger = logging.getLogger(__name__)
 
     def initialize_openai_client(self, api_key):
-        """Initialize OpenAI client with API key - Updated for v1.x"""
+        """Initialize OpenAI client with API key"""
         if api_key and api_key.startswith('sk-'):
             try:
-                # Simple initialization without proxies for v1.x
+                # Simple initialization for OpenAI v1.x
                 self.client = OpenAI(api_key=api_key)
-                # Test the client with a simple call
-                try:
-                    # Quick test to verify API key works
-                    test_response = self.client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": "Say 'test'"}],
-                        max_tokens=5
-                    )
-                    return True, "✅ OpenAI client initialized successfully"
-                except Exception as test_error:
-                    error_msg = str(test_error)
-                    if "insufficient_quota" in error_msg:
-                        return False, "❌ API key valid but insufficient quota"
-                    elif "invalid_api_key" in error_msg:
-                        return False, "❌ Invalid API key"
-                    else:
-                        return False, f"❌ API test failed: {error_msg}"
+
+                # Quick test to verify API key works
+                test_response = self.client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": "Say 'test'"}],
+                    max_tokens=5
+                )
+                return True, "✅ OpenAI client initialized successfully"
+
             except Exception as e:
-                return False, f"❌ Error initializing OpenAI client: {str(e)}"
+                error_msg = str(e).lower()
+                if "insufficient_quota" in error_msg:
+                    return False, "❌ API key valid but insufficient quota"
+                elif "invalid_api_key" in error_msg or "auth" in error_msg:
+                    return False, "❌ Invalid API key"
+                elif "proxies" in error_msg:
+                    # This is a version compatibility issue
+                    return False, "❌ API initialization error. Please ensure you're using the latest OpenAI library."
+                else:
+                    return False, f"❌ API error: {str(e)[:100]}"
         else:
             return False, "⚠️ Please enter a valid OpenAI API key (should start with 'sk-')"
 
