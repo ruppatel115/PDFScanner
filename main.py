@@ -1,45 +1,55 @@
 import streamlit as st
+
+# MUST be first Streamlit command - before any other st.* calls
+st.set_page_config(page_title="Invoice Data Extractor", page_icon="📊", layout="wide")
+
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
-import shutil
-import re
-import traceback
 import tempfile
-from pathlib import Path
 import zipfile
 import io
+import pandas as pd
+import re
 import base64
 
-# PDF and AI components
+# PDF processing
 try:
-    import PyPDF2
-except ImportError:
-    st.error("Please install PyPDF2: pip install PyPDF2")
+    from pypdf import PdfReader
 
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+# AI integration
 try:
     from openai import OpenAI
+
+    OPENAI_AVAILABLE = True
 except ImportError:
-    st.error("Please install openai: pip install openai")
+    OPENAI_AVAILABLE = False
 
-# Optional dependencies for OCR
-OCR_AVAILABLE = False
+# Image conversion for vision API
 try:
-    import pytesseract
     from pdf2image import convert_from_path
-    import cv2
-    import numpy as np
 
-    OCR_AVAILABLE = True
-except ImportError as e:
-    st.warning(f"OCR features disabled: {e}")
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
 
-class PDFInvoiceProcessor:
+try:
+    from PIL import Image
+
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+
+class InvoiceProcessor:
     def __init__(self):
         self.client = None
         self.setup_logging()
-        self.vendor_normalization_cache = {}  # Cache for normalized vendor names
 
     def setup_logging(self):
         logging.basicConfig(
@@ -51,18 +61,18 @@ class PDFInvoiceProcessor:
 
     def initialize_openai_client(self, api_key):
         """Initialize OpenAI client with API key"""
-        if api_key and api_key.startswith('sk-'):
-            try:
-                # Simple initialization for OpenAI v1.x
-                self.client = OpenAI(api_key=api_key)
+        if not OPENAI_AVAILABLE:
+            return False, "❌ OpenAI library not installed. Run: pip install openai"
 
-                # Quick test to verify API key works
+        if api_key and (api_key.startswith('sk-') or api_key.startswith('sk-proj-')):
+            try:
+                self.client = OpenAI(api_key=api_key)
                 test_response = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": "Say 'test'"}],
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": "test"}],
                     max_tokens=5
                 )
-                return True, "✅ OpenAI client initialized successfully"
+                return True, "✅ OpenAI API initialized successfully"
 
             except Exception as e:
                 error_msg = str(e).lower()
@@ -70,425 +80,290 @@ class PDFInvoiceProcessor:
                     return False, "❌ API key valid but insufficient quota"
                 elif "invalid_api_key" in error_msg or "auth" in error_msg:
                     return False, "❌ Invalid API key"
-                elif "proxies" in error_msg:
-                    # This is a version compatibility issue
-                    return False, "❌ API initialization error. Please ensure you're using the latest OpenAI library."
                 else:
                     return False, f"❌ API error: {str(e)[:100]}"
         else:
             return False, "⚠️ Please enter a valid OpenAI API key (should start with 'sk-')"
 
-    def normalize_vendor_name(self, vendor_name):
-        """Normalize vendor name to ensure consistent grouping"""
-        if not vendor_name or vendor_name == 'UnknownVendor':
-            return 'UnknownVendor'
+    def pdf_to_base64_image(self, pdf_path):
+        """Convert first page of PDF to base64 image for vision API"""
+        if not PDF2IMAGE_AVAILABLE or not PIL_AVAILABLE:
+            return None
 
-        # Check cache first
-        if vendor_name in self.vendor_normalization_cache:
-            return self.vendor_normalization_cache[vendor_name]
-
-        # Convert to lowercase for case-insensitive comparison
-        normalized = vendor_name.lower().strip()
-
-        # Remove common business suffixes and legal entities
-        suffixes_to_remove = [
-            r'\binc\.?$', r'\bllc\.?$', r'\bltd\.?$', r'\bcorp\.?$', r'\bcorporation\.?$',
-            r'\bcompany\.?$', r'\bco\.?$', r'\bllp\.?$', r'\bplc\.?$', r'\bgmbh\.?$',
-            r'\bincorporated\.?$', r'\blimited\.?$'
-        ]
-
-        for suffix in suffixes_to_remove:
-            normalized = re.sub(suffix, '', normalized)
-
-        # Remove punctuation and special characters (keep spaces, hyphens)
-        normalized = re.sub(r'[^\w\s\-]', '', normalized)
-
-        # Remove extra spaces and trim
-        normalized = re.sub(r'\s+', ' ', normalized).strip()
-
-        # If we ended up with empty string, use original
-        if not normalized:
-            normalized = vendor_name.lower().strip()
-
-        # Title case for consistency in display
-        normalized = normalized.title()
-
-        # Cache the result
-        self.vendor_normalization_cache[vendor_name] = normalized
-
-        return normalized
-
-    def extract_scan_date_from_filename(self, filename):
-        """Extract scan date from filename"""
         try:
-            date_pattern = r'(\d{4}-\d{2}-\d{2})'
-            match = re.search(date_pattern, filename)
-            if match:
-                date_str = match.group(1)
-                return datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y%m%d')
-        except:
-            pass
-        return datetime.now().strftime('%Y%m%d')
-
-    def extract_text_from_pdf(self, pdf_path):
-        """Extract text from PDF file using OCR for scanned documents"""
-        try:
-            # First try regular text extraction
-            with open(pdf_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in reader.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-
-                if text.strip():
-                    return text
-
-            # If no text found, use OCR for scanned documents
-            return self.extract_text_with_ocr(pdf_path)
-
+            images = convert_from_path(pdf_path, dpi=250, first_page=1, last_page=1)
+            if images:
+                img = images[0]
+                buffered = io.BytesIO()
+                img.save(buffered, format="PNG", optimize=True)
+                img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                return img_base64
         except Exception as e:
-            return self.extract_text_with_ocr(pdf_path)
+            self.logger.error(f"Error converting PDF to image: {e}")
+        return None
 
-    def extract_text_with_ocr(self, pdf_path):
-        """Extract text from scanned PDF using OCR"""
-        if not OCR_AVAILABLE:
-            return None
-
-        try:
-            # Convert PDF to images
-            images = convert_from_path(pdf_path, dpi=200)
-            full_text = ""
-
-            for image in images:
-                try:
-                    # Convert PIL image to OpenCV format
-                    open_cv_image = np.array(image)
-                    open_cv_image = open_cv_image[:, :, ::-1].copy()
-
-                    # Preprocess image for better OCR
-                    gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
-                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-                    # Use pytesseract to extract text
-                    page_text = pytesseract.image_to_string(thresh, config='--psm 6')
-                    full_text += page_text + "\n"
-                except Exception:
-                    continue
-
-            return full_text if full_text.strip() else None
-
-        except Exception:
-            return None
-
-    def extract_account_number_with_regex(self, text):
-        """Extract account numbers and important identifiers using focused regex patterns"""
-        try:
-            # Focus on specific patterns for account numbers and important IDs
-            patterns = [
-                # Account numbers with labels (most important)
-                r'account\s*[#:]?\s*([A-Z0-9\-]{5,})',
-                r'acct\s*[#:]?\s*([A-Z0-9\-]{5,})',
-                r'account\s*id\s*[#:]?\s*([A-Z0-9\-]{5,})',
-
-                # Policy numbers (for insurance documents)
-                r'policy[/\s]*account\s*no\.?\s*[#:]?\s*([A-Z0-9\-]{5,})',
-                r'policy\s*[#:]?\s*([A-Z0-9\-]{5,})',
-
-                # FEIN numbers (tax IDs)
-                r'fein\s*[#:]?\s*([A-Z0-9\-]{5,})',
-
-                # Invoice numbers (only if clearly labeled)
-                r'invoice\s*[#:]?\s*([A-Z0-9\-]{3,})',
-
-                # Letter IDs for official documents
-                r'letter\s*id\s*[#:]?\s*([A-Z0-9\-]{5,})',
-            ]
-
-            for pattern in patterns:
-                matches = re.findall(pattern, text, re.IGNORECASE)
-                if matches:
-                    account_number = matches[0].strip()
-                    # Validate it's a reasonable account number (not a date, amount, etc.)
-                    if self.is_valid_account_number(account_number):
-                        return account_number
-
-            # Look for standalone numbers that look like account numbers
-            # Focus on numbers that are 5+ digits and not dates/amounts
-            potential_numbers = re.findall(r'\b[A-Z0-9\-]{5,15}\b', text)
-            for number in potential_numbers:
-                if self.is_valid_account_number(number):
-                    return number
-
-            return "NoAcct"
-
-        except Exception:
-            return "NoAcct"
-
-    def is_valid_account_number(self, number):
-        """Validate if a string is likely to be an account number"""
-        # Remove common non-account number patterns
-        if not number or len(number) < 5:
-            return False
-
-        # Exclude dates
-        if re.match(r'^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$', number):
-            return False
-
-        # Exclude amounts with decimals
-        if re.match(r'^\$?\d+\.\d{2}$', number):
-            return False
-
-        # Exclude pure numbers that are too long (like meter readings)
-        if re.match(r'^\d{7,}$', number):
-            return False
-
-        # Exclude check numbers (typically 6-9 digits)
-        if re.match(r'^\d{6,9}$', number) and not any(keyword in number.lower() for keyword in ['check', 'chk']):
-            return False
-
-        return True
-
-    def extract_business_name_with_regex(self, text):
-        """Extract business names using focused patterns"""
-        try:
-            lines = text.split('\n')
-
-            # Look for common business name patterns
-            for i, line in enumerate(lines):
-                line_clean = line.strip()
-
-                # Look for company names in bill to/ship to sections
-                if any(prefix in line_clean.lower() for prefix in
-                       ['bill to', 'ship to', 'to:', 'payer name:', 'customer:']):
-                    # Next line often contains the business name
-                    if i + 1 < len(lines):
-                        next_line = lines[i + 1].strip()
-                        if next_line and len(next_line) > 3:
-                            return next_line
-
-                # Look for company names at the top of documents
-                if i < 5 and len(line_clean) > 5 and not any(
-                        word in line_clean.lower() for word in ['page', 'date', 'invoice', 'account']):
-                    # Check if it looks like a company name (not an address line, etc.)
-                    if (re.match(r'^[A-Za-z\s,&\.]+$', line_clean) and
-                            len(line_clean) > 5 and
-                            not re.match(r'^\d', line_clean) and
-                            not re.match(r'.*\d{5,}.*', line_clean)):
-                        return line_clean
-
-            return "UnknownBusiness"
-
-        except Exception:
-            return "UnknownBusiness"
-
-    def analyze_document_with_ai(self, text):
-        """Use AI to extract business name and account number with specific focus"""
+    def extract_invoice_data_with_vision(self, pdf_path, filename):
+        """Use GPT-4 Vision to extract invoice data from PDF image"""
         if not self.client:
             return None
 
-        text = text[:12000]
+        img_base64 = self.pdf_to_base64_image(pdf_path)
+        if not img_base64:
+            self.logger.warning("Could not convert PDF to image")
+            return None
 
-        prompt = f"""
-        Analyze this document text and extract the following key information:
+        prompt = """You are a precise document data extractor. Examine this document carefully and extract ONLY what you can clearly see.
 
-        BUSINESS NAME: Identify the MAIN BUSINESS or COMPANY that this document is for. This is typically:
-        - The "Bill To" company
-        - The "Ship To" company  
-        - The account holder
-        - The customer name
-        - The payer name
+RETURN THIS EXACT JSON FORMAT (use null for any field you cannot find or are unsure about):
+{
+    "vendor_name": "Company/organization that ISSUED this document (in letterhead/header)",
+    "business_name": "Company/person RECEIVING this document (Bill To, To, Customer)",
+    "invoice_number": "Document reference number (Invoice #, Letter ID, Check No, etc.)",
+    "amount": 0.00,
+    "invoice_date": "YYYY-MM-DD",
+    "payment_terms": "Payment terms if shown (e.g., '10 days', 'Net 30', 'Due on Receipt')",
+    "due_date": "YYYY-MM-DD",
+    "notes": "Any warnings, stamps, or status indicators (e.g., 'PAST DUE', 'PAID', 'FINAL NOTICE')"
+}
 
-        IMPORTANT: Look for the ACTUAL BUSINESS NAME, not the vendor/sender. For example:
-        - If it's a utility bill, the business name is who is being billed
-        - If it's an insurance document, the business name is the policy holder
-        - If it's a tax document, the business name is the taxpayer
+EXTRACTION RULES:
 
-        ACCOUNT NUMBER: Extract the most important PERMANENT IDENTIFIER for this business:
-        - Account numbers (look for "Account #", "Account ID", "Acct #")
-        - Policy numbers (look for "Policy/Account No")
-        - FEIN numbers (look for "FEIN")
-        - Customer account numbers
-        - Permanent reference numbers
+1. VENDOR_NAME: The organization at the TOP/HEADER of the document - who SENT it
+   - Look for company name in letterhead, logo area, or return address
 
-        Return ONLY valid JSON with these exact keys: business_name, account_number
+2. BUSINESS_NAME: The recipient of this document
+   - Look for "Bill To:", "To:", "Customer:", "Ship To:" sections
+   - This is who the document is addressed to
 
-        CRITICAL GUIDELINES:
-        - For business_name: Extract the ACTUAL BUSINESS/CUSTOMER name, not the vendor
-        - For account_number: Look for permanent identifiers, NOT temporary numbers like invoice numbers or check numbers
-        - If no clear business name found, use "UnknownBusiness"
-        - If no clear account number found, use "NoAcct"
+3. INVOICE_NUMBER: The document's unique identifier
+   - Common labels: "Invoice #", "Invoice Number", "Inv #", "Letter ID", "Document #", "Check No.", "Account ID"
+   - Extract the number/code shown
 
-        Document text:
-        {text}
-        """
+4. AMOUNT: The TOTAL amount due - look at the BOTTOM of the document
+   - Look for: "Total", "Amount Due", "Balance Due", "Total Due", "Payment Amount"
+   - Extract as a number WITHOUT currency symbols (e.g., 520.91 not $520.91)
+   - If multiple amounts shown, use the FINAL TOTAL at the bottom
+
+5. INVOICE_DATE: The date the document was created/issued
+   - Look for: "Date", "Invoice Date", "Date Issued", "Document Date"
+   - Format as YYYY-MM-DD
+
+6. PAYMENT_TERMS: How long to pay
+   - Look for: "Terms", "Payment Terms", "Net" followed by a number
+   - Examples: "10 days", "Net 30", "Due on Receipt"
+
+7. DUE_DATE: When payment is due - CALCULATE if not explicitly shown
+   - If "Due Date" is explicitly shown, use that date
+   - If only Terms shown (e.g., "10 days") and you have Invoice Date, CALCULATE: Invoice Date + Terms = Due Date
+   - Example: Invoice Date 5/31/2025 + Terms "10 days" = Due Date 2025-06-10
+   - Format as YYYY-MM-DD
+   - If you cannot determine, use null
+
+8. NOTES: Any special status indicators or warnings visible on the document
+   - Look for stamps, watermarks, or prominent text like: "PAST DUE", "PAID", "FINAL NOTICE", "OVERDUE", "URGENT", "NON-NEGOTIABLE"
+   - Also note document type if not a standard invoice: "Check", "Notice", "Statement"
+   - If none found, use null
+
+IMPORTANT:
+- Be PRECISE - only extract what you can clearly read
+- Use null for any field you're unsure about - do NOT guess
+- For amounts, ensure you're getting the TOTAL, not line items
+- Always try to calculate due_date from invoice_date + payment_terms if due_date is not explicitly shown"""
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o",
                 messages=[
-                    {"role": "system",
-                     "content": "You extract the business/customer name and account number from documents. Focus on the actual business the document is for, not the sender. Return valid JSON with business_name and account_number keys."},
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": "You are an expert document analyst. Extract data precisely and use null when uncertain. Always return valid JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_base64}",
+                                    "detail": "high"
+                                }
+                            }
+                        ]
+                    }
                 ],
-                temperature=0.1,
-                max_tokens=500
+                temperature=0.0,  # Most deterministic
+                max_tokens=600
             )
 
             result = response.choices[0].message.content.strip()
             result = re.sub(r'```json\s*|\s*```', '', result).strip()
 
+            self.logger.info(f"Vision API response for {filename}: {result[:300]}")
+
             data = json.loads(result)
-
-            # Apply normalization to business name for consistency
-            if 'business_name' in data:
-                original_business = data['business_name']
-                data['business_name'] = self.normalize_vendor_name(original_business)
-                data['original_business'] = original_business
-            else:
-                data['business_name'] = 'UnknownBusiness'
-
-            if 'account_number' not in data:
-                data['account_number'] = 'NoAcct'
-
-            return data
+            return self._validate_and_clean_data(data)
 
         except Exception as e:
-            print(f"AI Analysis Error: {e}")
-            return {'business_name': 'UnknownBusiness', 'account_number': 'NoAcct'}
+            self.logger.error(f"Vision API extraction error: {e}")
+            return None
 
-    def safe_filename(self, text):
-        """Convert text to safe filename"""
-        if not text:
-            return "Unknown"
-        safe = re.sub(r'[^\w\s\-\.]', '', str(text))
-        safe = re.sub(r'\s+', ' ', safe)
-        return safe.strip()
+    def _validate_and_clean_data(self, data):
+        """Validate and clean extracted data"""
 
-    def generate_filename(self, scan_date, document_data):
-        """Generate filename in format: YYYYMMDD BusinessName AccountNumber.pdf"""
+        # Text fields - use None/empty if not found
+        if not data.get('vendor_name'):
+            data['vendor_name'] = None
+        if not data.get('business_name'):
+            data['business_name'] = None
+        if not data.get('invoice_number'):
+            data['invoice_number'] = None
+        if not data.get('payment_terms'):
+            data['payment_terms'] = None
+        if not data.get('notes'):
+            data['notes'] = None
+
+        # Handle amount
+        if data.get('amount') is not None:
+            try:
+                amount_str = str(data['amount']).replace('$', '').replace(',', '').strip()
+                data['amount'] = float(amount_str)
+            except:
+                data['amount'] = None
+        else:
+            data['amount'] = None
+
+        # Validate invoice_date format
+        if data.get('invoice_date'):
+            try:
+                parsed_date = pd.to_datetime(data['invoice_date'])
+                data['invoice_date'] = parsed_date.strftime('%Y-%m-%d')
+            except:
+                data['invoice_date'] = None
+        else:
+            data['invoice_date'] = None
+
+        # Validate due_date format
+        if data.get('due_date'):
+            try:
+                parsed_date = pd.to_datetime(data['due_date'])
+                data['due_date'] = parsed_date.strftime('%Y-%m-%d')
+            except:
+                data['due_date'] = None
+        else:
+            data['due_date'] = None
+
+        # If we have invoice_date and payment_terms but no due_date, try to calculate
+        if data['invoice_date'] and data['payment_terms'] and not data['due_date']:
+            data['due_date'] = self._calculate_due_date(data['invoice_date'], data['payment_terms'])
+
+        return data
+
+    def _calculate_due_date(self, invoice_date_str, terms):
+        """Calculate due date from invoice date and payment terms"""
         try:
-            business_name = document_data.get('business_name', 'UnknownBusiness')
-            account_number = document_data.get('account_number', 'NoAcct')
+            invoice_date = datetime.strptime(invoice_date_str, '%Y-%m-%d')
 
-            safe_business = self.safe_filename(business_name)
-            safe_account = self.safe_filename(account_number)
+            # Extract number of days from terms
+            terms_lower = terms.lower()
 
-            filename = f"{scan_date} {safe_business} {safe_account}.pdf"
+            # Match patterns like "10 days", "net 30", "30 days", etc.
+            match = re.search(r'(\d+)\s*(?:days?|day)', terms_lower)
+            if match:
+                days = int(match.group(1))
+                due_date = invoice_date + timedelta(days=days)
+                return due_date.strftime('%Y-%m-%d')
 
-            print(f"DEBUG: Generated filename: {filename}")
-            return filename
+            # Match "net XX" pattern
+            match = re.search(r'net\s*(\d+)', terms_lower)
+            if match:
+                days = int(match.group(1))
+                due_date = invoice_date + timedelta(days=days)
+                return due_date.strftime('%Y-%m-%d')
 
         except Exception as e:
-            print(f"DEBUG: Error generating filename: {e}")
-            return f"{scan_date} UnknownBusiness NoAcct.pdf"
+            self.logger.error(f"Error calculating due date: {e}")
 
-    def process_single_pdf(self, file_content, original_filename, output_base):
-        """Process a single PDF file with focused business name and account number extraction"""
+        return None
+
+    def process_single_pdf(self, file_content, filename):
+        """Process a single PDF file and extract invoice data"""
         try:
-            # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
                 tmp_file.write(file_content)
                 tmp_path = tmp_file.name
 
-            # Extract scan date
-            scan_date = self.extract_scan_date_from_filename(original_filename)
+            invoice_data = None
 
-            # Extract text
-            text = self.extract_text_from_pdf(tmp_path)
-            if not text:
-                os.unlink(tmp_path)
-                return False, f"❌ Could not extract text from: {original_filename}"
+            if PDF2IMAGE_AVAILABLE:
+                self.logger.info(f"Processing {filename} with vision API")
+                invoice_data = self.extract_invoice_data_with_vision(tmp_path, filename)
 
-            # Use regex to extract business name and account number first
-            regex_business = self.extract_business_name_with_regex(text)
-            regex_account = self.extract_account_number_with_regex(text)
-
-            print(f"DEBUG: Regex found - Business: {regex_business}, Account: {regex_account}")
-
-            # Analyze with AI
-            document_data = self.analyze_document_with_ai(text)
-            if not document_data:
-                os.unlink(tmp_path)
-                return False, f"❌ AI analysis failed for: {original_filename}"
-
-            # Use regex as fallback for business name and account number
-            ai_business = document_data.get('business_name', 'UnknownBusiness')
-            ai_account = document_data.get('account_number', 'NoAcct')
-
-            print(f"DEBUG: AI found - Business: {ai_business}, Account: {ai_account}")
-
-            # Improved business name selection
-            if ai_business == 'UnknownBusiness' and regex_business != 'UnknownBusiness':
-                document_data['business_name'] = self.normalize_vendor_name(regex_business)
-                document_data['original_business'] = regex_business
-                print(f"DEBUG: Using regex business name: {regex_business}")
-
-            # Improved account number selection
-            if ai_account == 'NoAcct' and regex_account != 'NoAcct':
-                document_data['account_number'] = regex_account
-                print(f"DEBUG: Using regex account number: {regex_account}")
-
-            # Generate new filename
-            new_filename = self.generate_filename(scan_date, document_data)
-            if not new_filename:
-                os.unlink(tmp_path)
-                return False, f"❌ Failed to generate filename for: {original_filename}"
-
-            # Create business folder structure using NORMALIZED business name
-            business_name = document_data.get('business_name', 'UnknownBusiness')
-            original_business = document_data.get('original_business', business_name)
-            safe_business_name = self.safe_filename(business_name).replace(' ', '_')
-            business_folder = os.path.join(output_base, safe_business_name)
-            os.makedirs(business_folder, exist_ok=True)
-
-            # Copy file to organized location
-            target_path = os.path.join(business_folder, new_filename)
-
-            # Handle duplicates
-            base, ext = os.path.splitext(target_path)
-            counter = 1
-            while os.path.exists(target_path):
-                target_path = f"{base}_{counter}{ext}"
-                counter += 1
-
-            shutil.copy2(tmp_path, target_path)
-
-            # Clean up temporary file
             os.unlink(tmp_path)
 
-            return True, {
-                "original": original_filename,
-                "new": new_filename,
-                "business": business_name,
-                "original_business": original_business,
-                "account_number": document_data.get('account_number', 'NoAcct'),
-                "path": target_path
-            }
+            if not invoice_data:
+                return {
+                    'filename': filename,
+                    'vendor_name': None,
+                    'business_name': None,
+                    'invoice_number': None,
+                    'amount': None,
+                    'invoice_date': None,
+                    'payment_terms': None,
+                    'due_date': None,
+                    'notes': None,
+                    'date_processed': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'status': 'Failed - Could not extract data'
+                }
+
+            invoice_data['filename'] = filename
+            invoice_data['date_processed'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            invoice_data['status'] = 'Success'
+
+            return invoice_data
 
         except Exception as e:
-            # Clean up temporary file if it exists
-            try:
-                if 'tmp_path' in locals():
-                    os.unlink(tmp_path)
-            except:
-                pass
-            return False, f"❌ Error processing {original_filename}: {str(e)}"
+            self.logger.error(f"Error processing {filename}: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'filename': filename,
+                'vendor_name': None,
+                'business_name': None,
+                'invoice_number': None,
+                'amount': None,
+                'invoice_date': None,
+                'payment_terms': None,
+                'due_date': None,
+                'notes': None,
+                'date_processed': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'status': f'Failed - {str(e)[:100]}'
+            }
 
 
 def main():
-    st.title("📄 AI PDF Document Renamer")
-    st.markdown("### Focused Business Name & Account Number Extraction")
+    if not PDF_AVAILABLE:
+        st.error("❌ pypdf is not installed. Please run: `pip install pypdf`")
+        st.stop()
 
-    # Initialize processor
+    if not OPENAI_AVAILABLE:
+        st.error("❌ openai is not installed. Please run: `pip install openai`")
+        st.stop()
+
+    st.title("📊 Invoice Data Extractor v3")
+    st.markdown("### Extract structured data from invoices using GPT-4 Vision")
+
+    # Initialize session state
     if 'processor' not in st.session_state:
-        st.session_state.processor = PDFInvoiceProcessor()
+        st.session_state.processor = InvoiceProcessor()
+    if 'api_key_valid' not in st.session_state:
         st.session_state.api_key_valid = False
-        st.session_state.processed_files = []
-        st.session_state.processing_log = []
+    if 'results_df' not in st.session_state:
+        st.session_state.results_df = None
+    if 'processing_complete' not in st.session_state:
+        st.session_state.processing_complete = False
 
-    # Sidebar for configuration
+    # Sidebar
     with st.sidebar:
         st.header("🔑 Configuration")
 
@@ -496,13 +371,12 @@ def main():
             "OpenAI API Key",
             type="password",
             placeholder="sk-...",
-            help="Get your API key from platform.openai.com",
-            key="api_key_input"
+            help="Get your API key from platform.openai.com"
         )
 
-        if st.button("Validate API Key", key="validate_btn"):
+        if st.button("Validate API Key"):
             if api_key:
-                with st.spinner("Validating API key..."):
+                with st.spinner("Validating..."):
                     success, message = st.session_state.processor.initialize_openai_client(api_key)
                     if success:
                         st.session_state.api_key_valid = True
@@ -514,246 +388,226 @@ def main():
             else:
                 st.error("Please enter an API key")
 
-        # Show current status
         if st.session_state.get('api_key_valid', False):
             st.success("✅ API Key Valid")
         else:
-            st.warning("❌ API Key Not Valid")
+            st.warning("⚠️ API Key Not Configured")
 
         st.markdown("---")
-        st.header("📋 Instructions")
-        st.markdown("""
-        1. 🔑 Enter & validate your OpenAI API key
-        2. 📁 Upload PDF files using the file uploader
-        3. 🚀 Click 'Process Files' to start
-        4. 📥 Download processed files as ZIP
+        st.header("🔧 System Status")
+        if PDF2IMAGE_AVAILABLE:
+            st.success("✅ Vision API Ready")
+        else:
+            st.error("❌ Install pdf2image: `pip install pdf2image`")
 
-        **Features:**
-        - **Business name extraction** (who the document is FOR)
-        - **Account number extraction** (permanent identifiers)
-        - OCR for scanned documents
-        - Organized folder structure by business
-        - Consistent business grouping
+        st.markdown("---")
+        st.header("📋 Extracted Fields")
+        st.markdown("""
+        - **Vendor Name** - Document issuer
+        - **Business Name** - Recipient  
+        - **Invoice Number** - Document ID
+        - **Amount** - Total due
+        - **Invoice Date** - Document date
+        - **Payment Terms** - e.g., "10 days"
+        - **Due Date** - Calculated/explicit
+        - **Notes** - PAST DUE, PAID, etc.
         """)
 
-    # Main content area
-    tab1, tab2 = st.tabs(["📁 Upload & Process", "⚙️ Settings & Info"])
+    # Main content
+    if not st.session_state.get('api_key_valid', False):
+        st.warning("⚠️ Please configure your OpenAI API key in the sidebar.")
+        st.info("""
+        **Requirements:**
+        ```bash
+        pip install openai pypdf pdf2image pillow
+        # Plus poppler:
+        # Linux: apt-get install poppler-utils
+        # Mac: brew install poppler
+        ```
+        """)
+        st.stop()
 
-    with tab1:
-        st.header("Upload PDF Files")
+    # Show results
+    if st.session_state.results_df is not None and st.session_state.processing_complete:
+        st.header("✅ Processing Complete!")
 
-        if not st.session_state.get('api_key_valid', False):
-            st.warning("⚠️ Please enter and validate a valid OpenAI API key in the sidebar to continue.")
-        else:
-            # File upload section with better styling
-            st.subheader("📤 Upload Your PDF Files")
+        df = st.session_state.results_df
 
-            uploaded_files = st.file_uploader(
-                "Choose PDF files",
-                type="pdf",
-                accept_multiple_files=True,
-                help="Select one or more PDF files to process. You can select multiple files at once.",
-                key="file_uploader"
-            )
+        # Summary
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Files", len(df))
+        with col2:
+            successful = len(df[df['status'] == 'Success'])
+            st.metric("Successful", successful)
+        with col3:
+            total_amount = df['amount'].sum() if df['amount'].notna().any() else 0
+            st.metric("Total Amount", f"${total_amount:,.2f}")
+        with col4:
+            past_due = len(df[df['notes'].str.contains('PAST DUE', case=False, na=False)])
+            st.metric("Past Due", past_due)
 
-            if uploaded_files:
-                st.success(f"📄 Selected {len(uploaded_files)} file(s) for processing")
+        # Data table
+        st.subheader("📋 Extracted Data")
 
-                # Show file list
-                with st.expander("View Selected Files", expanded=True):
-                    for i, file in enumerate(uploaded_files):
-                        st.write(f"{i + 1}. {file.name} ({file.size / 1024:.1f} KB)")
+        # Reorder columns for display
+        display_cols = [
+            'filename', 'vendor_name', 'business_name', 'invoice_number',
+            'amount', 'invoice_date', 'payment_terms', 'due_date', 'notes', 'status'
+        ]
+        display_df = df[[c for c in display_cols if c in df.columns]]
 
-                # Processing options
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    if st.button("🚀 Process Files", type="primary", use_container_width=True):
-                        # Create temporary directory for processing
-                        with tempfile.TemporaryDirectory() as temp_dir:
-                            processed_files = []
-                            log_messages = []
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                "invoice_date": st.column_config.DateColumn("Invoice Date", format="YYYY-MM-DD"),
+                "due_date": st.column_config.DateColumn("Due Date", format="YYYY-MM-DD"),
+                "notes": st.column_config.TextColumn("Notes/Status", width="medium"),
+            }
+        )
 
-                            # Progress tracking
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            results_placeholder = st.empty()
-
-                            for i, uploaded_file in enumerate(uploaded_files):
-                                # Update progress
-                                progress = (i + 1) / len(uploaded_files)
-                                progress_bar.progress(progress)
-                                status_text.text(f"🔍 Processing {i + 1}/{len(uploaded_files)}: {uploaded_file.name}")
-
-                                # Process file
-                                success, result = st.session_state.processor.process_single_pdf(
-                                    uploaded_file.getvalue(),
-                                    uploaded_file.name,
-                                    temp_dir
-                                )
-
-                                if success:
-                                    processed_files.append(result)
-                                    log_messages.append(f"✅ {result['original']} → {result['new']}")
-                                    st.session_state.processed_files.append(result)
-                                else:
-                                    log_messages.append(result)
-                                    st.session_state.processing_log.append(result)
-
-                            # Create ZIP file if we have processed files
-                            if processed_files:
-                                zip_buffer = io.BytesIO()
-                                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                                    for root, dirs, files in os.walk(temp_dir):
-                                        for file in files:
-                                            file_path = os.path.join(root, file)
-                                            arcname = os.path.relpath(file_path, temp_dir)
-                                            zip_file.write(file_path, arcname)
-
-                                zip_buffer.seek(0)
-
-                                # Show success message and download button
-                                st.success(
-                                    f"🎉 Successfully processed {len(processed_files)} out of {len(uploaded_files)} files!")
-
-                                # Show business grouping information
-                                businesses = {}
-                                for result in processed_files:
-                                    business = result['business']
-                                    if business not in businesses:
-                                        businesses[business] = []
-                                    businesses[business].append(result)
-
-                                # Display business grouping
-                                with st.expander("🏢 Business Grouping Summary", expanded=True):
-                                    for business, files in businesses.items():
-                                        st.write(f"**{business}**: {len(files)} file(s)")
-                                        for file in files:
-                                            st.write(f"  - {file['original']} → {file['new']}")
-
-                                # Download button
-                                st.download_button(
-                                    label="📥 Download Processed Files (ZIP)",
-                                    data=zip_buffer,
-                                    file_name="processed_documents.zip",
-                                    mime="application/zip",
-                                    use_container_width=True
-                                )
-
-                                # Show processing summary
-                                with st.expander("📊 Processing Summary", expanded=True):
-                                    st.subheader("Processed Files")
-                                    for result in processed_files:
-                                        col1, col2, col3 = st.columns([3, 2, 1])
-                                        with col1:
-                                            st.write(f"**{result['original']}**")
-                                            if result.get('original_business') and result['original_business'] != \
-                                                    result['business']:
-                                                st.caption(f"Original: {result['original_business']}")
-                                        with col2:
-                                            st.write(f"→ **{result['new']}**")
-                                        with col3:
-                                            st.write(f"Acct: {result['account_number']}")
-
-                                # Show detailed log
-                                with st.expander("📋 Detailed Processing Log"):
-                                    for log in log_messages:
-                                        if log.startswith("✅"):
-                                            st.success(log)
-                                        elif log.startswith("❌"):
-                                            st.error(log)
-                                        else:
-                                            st.info(log)
-                            else:
-                                st.error(
-                                    "❌ No files were successfully processed. Check the processing log for details.")
-
-                            # Clear progress indicators
-                            progress_bar.empty()
-                            status_text.empty()
-
-                with col2:
-                    if st.button("🗑️ Clear Files", use_container_width=True):
-                        st.session_state.processed_files = []
-                        st.session_state.processing_log = []
-                        st.rerun()
-
-            else:
-                # Show upload instructions when no files are selected
-                st.info("""
-                **💡 How to use:**
-                1. Click 'Browse files' or drag & drop PDF files above
-                2. Select one or multiple PDF files
-                3. Click 'Process Files' to start AI-powered renaming
-                4. Download the organized ZIP file
-
-                **FOCUSED EXTRACTION:**
-                - **Business Names**: Extracts who the document is FOR (Bill To, Customer, Payer)
-                - **Account Numbers**: Finds permanent identifiers (Account #, Policy #, FEIN)
-                - **Smart Filtering**: Ignores temporary numbers (check numbers, invoice numbers)
-                - **Consistent Grouping**: Same business = same folder
-                """)
-
-    with tab2:
-        st.header("Settings & Information")
-
+        # Download buttons
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("🛠️ System Status")
-            if OCR_AVAILABLE:
-                st.success("✅ OCR features are available")
-            else:
-                st.warning("⚠️ OCR features are disabled")
-
-            if st.session_state.get('api_key_valid', False):
-                st.success("✅ OpenAI API is connected")
-            else:
-                st.warning("⚠️ OpenAI API not configured")
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"invoice_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                type="primary",
+                use_container_width=True
+            )
 
         with col2:
-            st.subheader("📊 Statistics")
-            if st.session_state.processed_files:
-                st.write(f"📁 Files processed: {len(st.session_state.processed_files)}")
+            if st.button("🔄 Process New Files", use_container_width=True):
+                st.session_state.results_df = None
+                st.session_state.processing_complete = False
+                st.rerun()
 
-                # Show business count
-                businesses = set(f['business'] for f in st.session_state.processed_files)
-                st.write(f"🏢 Unique businesses: {len(businesses)}")
+        # Breakdown sections
+        col1, col2 = st.columns(2)
 
-                # Show account numbers found
-                account_numbers = [f['account_number'] for f in st.session_state.processed_files if
-                                   f['account_number'] != 'NoAcct']
-                st.write(
-                    f"🔢 Documents with account numbers: {len(account_numbers)}/{len(st.session_state.processed_files)}")
+        with col1:
+            st.subheader("📊 By Vendor")
+            if df['vendor_name'].notna().any():
+                vendor_summary = df[df['vendor_name'].notna()].groupby('vendor_name').agg({
+                    'amount': 'sum',
+                    'filename': 'count'
+                }).rename(columns={'filename': 'count'}).sort_values('amount', ascending=False)
+                st.dataframe(vendor_summary, column_config={
+                    "amount": st.column_config.NumberColumn("Total", format="$%.2f"),
+                    "count": "Count"
+                })
+
+        with col2:
+            st.subheader("⚠️ Items Needing Attention")
+            attention_df = df[
+                (df['notes'].notna()) |
+                (df['amount'].isna()) |
+                (df['due_date'].isna())
+                ][['filename', 'notes', 'amount', 'due_date']]
+            if len(attention_df) > 0:
+                st.dataframe(attention_df, hide_index=True)
             else:
-                st.write("No files processed yet")
+                st.success("All items extracted successfully!")
 
-        st.subheader("🔧 Technical Information")
-        st.info("""
-        **Supported Features:**
-        - PDF text extraction using PyPDF2
-        - OCR for scanned documents (Tesseract)
-        - AI-powered business name and account number detection
-        - Automatic file organization by business
-        - Duplicate file handling
-        - ZIP file export
-        - Business name normalization
-        - **Focused account number extraction**
+    else:
+        # Upload section
+        st.header("📤 Upload Invoice Files")
 
-        **What We Extract:**
-        - **Business Names**: Bill To, Customer, Payer names
-        - **Account Numbers**: Permanent identifiers only
-        - **Policy Numbers**: Insurance policy numbers
-        - **FEIN Numbers**: Tax identification numbers
-        - **Account IDs**: Customer account numbers
+        upload_type = st.radio(
+            "Upload method:",
+            ["Individual PDF files", "ZIP file (folder of PDFs)"],
+            horizontal=True
+        )
 
-        **File Naming Format:**
-        `YYYYMMDD BusinessName AccountNumber.pdf`
+        files_to_process = []
 
-        **Output Structure:**
-        - Files organized in business-named folders
-        - Original files preserved
-        - Automatic duplicate resolution
-        """)
+        if upload_type == "Individual PDF files":
+            uploaded_files = st.file_uploader(
+                "Upload PDF invoices",
+                type="pdf",
+                accept_multiple_files=True
+            )
+            if uploaded_files:
+                for f in uploaded_files:
+                    files_to_process.append({
+                        'name': f.name,
+                        'content': f.getvalue()
+                    })
+        else:
+            zip_file = st.file_uploader(
+                "Upload ZIP file containing PDFs",
+                type="zip"
+            )
+            if zip_file:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(zip_file.read())) as z:
+                        pdf_files = [f for f in z.namelist() if
+                                     f.lower().endswith('.pdf') and not f.startswith('__MACOSX')]
+                        st.success(f"Found {len(pdf_files)} PDF files")
+                        for pdf_name in pdf_files:
+                            files_to_process.append({
+                                'name': os.path.basename(pdf_name),
+                                'content': z.read(pdf_name)
+                            })
+                except Exception as e:
+                    st.error(f"Error reading ZIP: {e}")
+
+        if files_to_process:
+            st.success(f"📄 Ready to process {len(files_to_process)} file(s)")
+
+            with st.expander("View files"):
+                for i, file in enumerate(files_to_process):
+                    st.write(f"{i + 1}. {file['name']}")
+
+            if st.button("🚀 Process Invoices", type="primary", use_container_width=True):
+                results = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for i, file in enumerate(files_to_process):
+                    progress_bar.progress((i + 1) / len(files_to_process))
+                    status_text.text(f"🔍 Processing {i + 1}/{len(files_to_process)}: {file['name']}")
+                    result = st.session_state.processor.process_single_pdf(file['content'], file['name'])
+                    results.append(result)
+
+                df = pd.DataFrame(results)
+
+                # Reorder columns
+                column_order = [
+                    'filename', 'vendor_name', 'business_name', 'invoice_number',
+                    'amount', 'invoice_date', 'payment_terms', 'due_date', 'notes',
+                    'date_processed', 'status'
+                ]
+                df = df[[c for c in column_order if c in df.columns]]
+
+                st.session_state.results_df = df
+                st.session_state.processing_complete = True
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.success(f"✅ Processed {len(results)} invoices!")
+                st.balloons()
+                st.rerun()
+
+        else:
+            st.info("""
+            **💡 New in v3:**
+            - **Invoice Date** column - the date shown on the document
+            - **Payment Terms** column - e.g., "10 days", "Net 30"
+            - **Due Date** is now CALCULATED from Invoice Date + Terms when not explicit
+            - **Notes** column captures "PAST DUE", "PAID", "FINAL NOTICE", etc.
+            - More conservative extraction - leaves fields blank when uncertain
+
+            **Upload your PDFs to get started!**
+            """)
 
 
 if __name__ == "__main__":
